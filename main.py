@@ -9,7 +9,6 @@ from fastapi import FastAPI, WebSocket, Request, Response
 from config import DOMAIN, sessions
 from stt import run_recognition_loop
 from tts import speak_response
-from llm import get_greeting
 
 print("[main] Starting JusticeLine API", flush=True)
 app = FastAPI()
@@ -45,6 +44,11 @@ async def twilio_webhook(request: Request):
 </Response>
 """
     return Response(content=twiml, media_type="text/xml")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "JusticeLine"}
 
 
 @app.websocket("/media")
@@ -124,15 +128,46 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 def _play_greeting(call_sid: str, websocket, loop) -> None:
-    """Play the opening message as soon as the stream starts."""
+    """Play the 3-part scripted opening with pauses, matching idea.txt flow:
+    1. Emergency disclaimer  →  5s pause
+    2. AI disclaimer         →  5s pause
+    3. Situation prompt      →  listen
+    """
     import time
-    time.sleep(0.8)  # brief pause for stream to stabilize before speaking
+    time.sleep(0.8)  # let stream stabilize
+
     session = sessions.get(call_sid)
     if not session:
         return
-    greeting = get_greeting()
-    print(f"[main] Playing greeting for {call_sid}", flush=True)
-    speak_response(call_sid, greeting, websocket, loop)
+
+    # Part 1 — emergency disclaimer
+    emergency = (
+        "Welcome to JusticeLine. / Bienvenue à JusticeLine. / مرحباً بك في JusticeLine. "
+        "If this is an emergency, hang up and dial 9-1-1 immediately."
+    )
+    print(f"[main] Greeting part 1 for {call_sid}", flush=True)
+    speak_response(call_sid, emergency, websocket, loop)
+    time.sleep(5)
+
+    if call_sid not in sessions:
+        return
+
+    # Part 2 — AI disclaimer
+    ai_disclaimer = (
+        "This is an AI-powered legal helpline. It is prone to error. "
+        "Please stay on the line if you understand and accept this."
+    )
+    print(f"[main] Greeting part 2 for {call_sid}", flush=True)
+    speak_response(call_sid, ai_disclaimer, websocket, loop)
+    time.sleep(5)
+
+    if call_sid not in sessions:
+        return
+
+    # Part 3 — situation prompt
+    situation_prompt = "Please tell me about your legal situation."
+    print(f"[main] Greeting part 3 for {call_sid}", flush=True)
+    speak_response(call_sid, situation_prompt, websocket, loop)
 
 
 if __name__ == "__main__":
