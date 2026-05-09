@@ -3,7 +3,7 @@ import requests
 
 OJ_BASE = os.getenv("OPENJUSTICE_BASE_URL", "https://api.openjustice.ai/api")
 OJ_KEY = os.getenv("OPENJUSTICE_API_KEY", "")
-OJ_FLOW_ID = os.getenv("OPENJUSTICE_DIALOG_FLOW_ID", "45ebe699-1ff4-45c6-b82c-eb565e153ee")
+OJ_FLOW_ID = os.getenv("OPENJUSTICE_DIALOG_FLOW_ID", "45ebe699-1ff4-45c6-b82c-eb565e153ee6")
 
 _FALLBACK = (
     "Based on what you've described, you may have grounds to pursue a legal remedy. "
