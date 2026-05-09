@@ -36,7 +36,7 @@ def _body_for_lang(language_code: str) -> str:
     return _RESOURCES.get(prefix, _RESOURCES["en"])
 
 
-def send_sms_resources(to_number: str, language_code: str = "en-US") -> bool:
+def send_sms_resources(to_number: str, language_code: str = "en") -> bool:
     if not twilio_client:
         print("[sms] Twilio client not initialized", flush=True)
         return False
