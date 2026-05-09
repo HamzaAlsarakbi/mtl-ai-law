@@ -155,77 +155,84 @@ async def media_stream(websocket: WebSocket):
         ),
     )
 
-    async with client.aio.live.connect(model=MODEL, config=live_config) as session:
+    try:
+        async with client.aio.live.connect(model=MODEL, config=live_config) as session:
 
-        async def _receiver():
-            nonlocal downsample_state, stream_sid
+            async def _receiver():
+                nonlocal downsample_state, stream_sid
+                try:
+                    async for response in session.receive():
+                        # Audio from Gemini → forward to Twilio
+                        if (response.server_content
+                                and response.server_content.model_turn):
+                            for part in response.server_content.model_turn.parts:
+                                if part.inline_data and part.inline_data.data:
+                                    b64, downsample_state = _audio_gemini_to_twilio(
+                                        part.inline_data.data, downsample_state
+                                    )
+                                    if stream_sid:
+                                        await websocket.send_json({
+                                            "event": "media",
+                                            "streamSid": stream_sid,
+                                            "media": {"payload": b64},
+                                        })
+
+                        # Function call from Gemini → execute → return result
+                        if response.tool_call:
+                            for fc in response.tool_call.function_calls:
+                                result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
+                                await session.send(
+                                    input=types.LiveClientToolResponse(
+                                        function_responses=[types.FunctionResponse(
+                                            name=fc.name,
+                                            id=fc.id,
+                                            response={"result": result},
+                                        )]
+                                    )
+                                )
+                except Exception as e:
+                    print(f"[gemini] receiver error: {e}", flush=True)
+
+            receiver_task = asyncio.create_task(_receiver())
+
             try:
-                async for response in session.receive():
-                    # Audio from Gemini → forward to Twilio
-                    if (response.server_content
-                            and response.server_content.model_turn):
-                        for part in response.server_content.model_turn.parts:
-                            if part.inline_data and part.inline_data.data:
-                                b64, downsample_state = _audio_gemini_to_twilio(
-                                    part.inline_data.data, downsample_state
-                                )
-                                if stream_sid:
-                                    await websocket.send_json({
-                                        "event": "media",
-                                        "streamSid": stream_sid,
-                                        "media": {"payload": b64},
-                                    })
+                async for message in websocket.iter_text():
+                    data = json.loads(message)
+                    event = data.get("event")
 
-                    # Function call from Gemini → execute → return result
-                    if response.tool_call:
-                        for fc in response.tool_call.function_calls:
-                            result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
+                    if event == "start":
+                        call_sid = data["start"]["callSid"]
+                        stream_sid = data["start"]["streamSid"]
+                        caller_number = _pending_callers.pop(call_sid, None)
+                        print(f"[main] start: {call_sid} stream={stream_sid} from={caller_number}", flush=True)
+
+                    elif event == "media":
+                        chunk = base64.b64decode(data["media"]["payload"])
+                        pcm_16k, upsample_state = _audio_twilio_to_gemini(chunk, upsample_state)
+                        audio_buffer.extend(pcm_16k)
+                        # Send ~300ms chunks (9600 bytes @ 16kHz stereo-mono)
+                        if len(audio_buffer) >= 9600:
                             await session.send(
-                                input=types.LiveClientToolResponse(
-                                    function_responses=[types.FunctionResponse(
-                                        name=fc.name,
-                                        id=fc.id,
-                                        response={"result": result},
-                                    )]
-                                )
+                                input={"data": bytes(audio_buffer), "mime_type": "audio/pcm;rate=16000"},
+                                end_of_turn=False,
                             )
+                            audio_buffer.clear()
+
+                    elif event == "stop":
+                        print(f"[main] stop event for {call_sid}", flush=True)
+                        break
+
             except Exception as e:
-                print(f"[gemini] receiver error: {e}", flush=True)
-
-        receiver_task = asyncio.create_task(_receiver())
-
+                print(f"[main] WebSocket error: {e}", flush=True)
+            finally:
+                receiver_task.cancel()
+                print(f"[main] Session closed for {call_sid}", flush=True)
+    except Exception as e:
+        print(f"[main] Gemini Live connection failed: {e}", flush=True)
         try:
-            async for message in websocket.iter_text():
-                data = json.loads(message)
-                event = data.get("event")
-
-                if event == "start":
-                    call_sid = data["start"]["callSid"]
-                    stream_sid = data["start"]["streamSid"]
-                    caller_number = _pending_callers.pop(call_sid, None)
-                    print(f"[main] start: {call_sid} stream={stream_sid} from={caller_number}", flush=True)
-
-                elif event == "media":
-                    chunk = base64.b64decode(data["media"]["payload"])
-                    pcm_16k, upsample_state = _audio_twilio_to_gemini(chunk, upsample_state)
-                    audio_buffer.extend(pcm_16k)
-                    # Send ~300ms chunks (9600 bytes @ 16kHz stereo-mono)
-                    if len(audio_buffer) >= 9600:
-                        await session.send(
-                            input={"data": bytes(audio_buffer), "mime_type": "audio/pcm;rate=16000"},
-                            end_of_turn=False,
-                        )
-                        audio_buffer.clear()
-
-                elif event == "stop":
-                    print(f"[main] stop event for {call_sid}", flush=True)
-                    break
-
-        except Exception as e:
-            print(f"[main] WebSocket error: {e}", flush=True)
-        finally:
-            receiver_task.cancel()
-            print(f"[main] Session closed for {call_sid}", flush=True)
+            await websocket.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
