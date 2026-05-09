@@ -1,6 +1,6 @@
 import queue
 from google.cloud import speech
-from config import speech_client, translate_client
+from config import speech_client, translate_client, sessions
 from llm import query_gemini
 from tts import speak_response
 
@@ -33,12 +33,17 @@ def _request_generator(audio_queue: queue.Queue):
         yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
 
-def run_recognition_loop(audio_queue: queue.Queue, call_sid_ref: list) -> None:
+def run_recognition_loop(audio_queue: queue.Queue, call_sid_ref: list, websocket, loop) -> None:
     """
     Runs STT in a loop, restarting the stream as needed.
 
     call_sid_ref is a one-element list so the websocket handler can mutate it
     after this thread starts (call SID arrives on the 'start' event).
+
+    websocket + loop are passed through to speak_response so it can use
+    asyncio.run_coroutine_threadsafe to send audio back over the WebSocket
+    from this worker thread (per RESEARCH Pattern 2 — never call
+    await websocket.send_text from a non-asyncio thread).
     """
     print("[stt] Recognition loop starting", flush=True)
     streaming_config = _make_streaming_config()
@@ -60,7 +65,19 @@ def run_recognition_loop(audio_queue: queue.Queue, call_sid_ref: list) -> None:
                     if result.is_final:
                         user_text = result.alternatives[0].transcript
                         confidence = result.alternatives[0].confidence
-                        print(f"[stt] Detected: '{user_text}' (confidence: {confidence:.2f})", flush=True)
+                        # Per D-02 + RESEARCH Pattern 4: read result.language_code (BCP-47),
+                        # default to en-US when missing. Top-level on StreamingRecognitionResult.
+                        detected_lang = result.language_code or "en-US"
+                        print(f"[stt] Detected: '{user_text}' lang={detected_lang} (conf: {confidence:.2f})", flush=True)
+
+                        call_sid = call_sid_ref[0]
+                        # Write detected language to session immediately (per D-02).
+                        if call_sid and call_sid in sessions:
+                            sessions[call_sid]["language"] = detected_lang
+                            # Append user turn to conversation history for Phase 2.
+                            sessions[call_sid]["conversation_history"].append(
+                                {"role": "user", "text": user_text, "lang": detected_lang}
+                            )
 
                         if confidence < 0.5 and len(result.alternatives) > 1:
                             alt = result.alternatives[1]
@@ -70,9 +87,11 @@ def run_recognition_loop(audio_queue: queue.Queue, call_sid_ref: list) -> None:
                         english_text = translated["translatedText"]
                         print(f"[stt] English: {english_text}", flush=True)
 
-                        if call_sid_ref[0]:
+                        if call_sid:
                             gemini_response = query_gemini(english_text)
-                            speak_response(call_sid_ref[0], gemini_response)
+                            # Plan 02 will give speak_response the new (call_sid, text, websocket, loop) signature.
+                            # Forward-compatible call: pass websocket + loop through.
+                            speak_response(call_sid, gemini_response, websocket, loop)
                         else:
                             print("[stt] No call SID yet, skipping response", flush=True)
 
