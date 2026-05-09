@@ -4,8 +4,11 @@ import os
 import queue
 import threading
 from fastapi import FastAPI, WebSocket, Response
-from google.cloud import speech, translate_v2 as translate
+from google.cloud import speech, translate_v2 as translate, texttospeech_v1 as texttospeech
 from google.cloud import aiplatform
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from twilio.rest import Client as TwilioClient
 
 app = FastAPI()
 
@@ -16,6 +19,17 @@ def _normalize_stream_host(raw_host: str) -> str:
 # Initialize Google Cloud Clients
 speech_client = speech.SpeechClient()
 translate_client = translate.Client()
+tts_client = texttospeech.TextToSpeechClient()
+
+# Initialize Vertex AI / Gemini
+project_id = os.getenv("GCP_PROJECT_ID", "")
+vertexai.init(project=project_id)
+gemini_model = GenerativeModel("gemini-2.5-flash")
+
+# Initialize Twilio client
+twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "")
+twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "")
+twilio_client = TwilioClient(twilio_account_sid, twilio_auth_token) if twilio_account_sid else None
 
 # Replace with your actual public host name, without scheme.
 DOMAIN = _normalize_stream_host(os.getenv("TWILIO_STREAM_HOST", "openjustice-agent-966017992454.us-central1.run.app"))
@@ -37,6 +51,55 @@ async def twilio_webhook():
     print(f"TwiML response: {twiml.strip()}", flush=True)
     return Response(content=twiml, media_type="text/xml")
 
+def query_gemini(user_text: str) -> str:
+    """Query Gemini for a legal response based on user input."""
+    try:
+        print(f"Querying Gemini with: {user_text}", flush=True)
+        response = gemini_model.generate_content(
+            f"""You are a helpful legal information assistant for Montreal. 
+The user asked: {user_text}
+
+Provide a brief, conversational response (under 100 words) addressing their legal question.
+Do not provide legal advice; provide general legal information and suggest they consult a lawyer."""
+        )
+        result = response.text.strip()
+        print(f"Gemini response: {result}", flush=True)
+        return result
+    except Exception as e:
+        print(f"Gemini Error: {e}", flush=True)
+        return "I'm having trouble processing that. Could you rephrase your question?"
+
+
+def speak_response(call_sid: str, text: str) -> None:
+    """Convert text to speech and play it back on the Twilio call."""
+    if not twilio_client:
+        print("Twilio client not configured, skipping TTS", flush=True)
+        return
+    
+    try:
+        print(f"Generating TTS for: {text}", flush=True)
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="en-US",
+            name="en-US-Neural2-C"
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
+        response = tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
+        
+        # Use Twilio Call API to play the response
+        print(f"Playing response on call {call_sid}", flush=True)
+        twilio_client.calls(call_sid).update(twiml=f"<Response><Say>{text}</Say></Response>")
+        print("Response spoken", flush=True)
+    except Exception as e:
+        print(f"TTS/Twilio Error: {e}", flush=True)
+
+
 @app.websocket("/media")
 async def websocket_endpoint(websocket: WebSocket):
     print(f"WebSocket handshake from {websocket.client}", flush=True)
@@ -44,6 +107,7 @@ async def websocket_endpoint(websocket: WebSocket):
     print("WebSocket connection established", flush=True)
     
     audio_queue = queue.Queue()
+    call_sid = None  # Will be captured from Twilio metadata
 
     def request_generator():
         print("Speech request generator started", flush=True)
@@ -99,7 +163,13 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                             # Translation and OpenJustice logic
                             translated = translate_client.translate(user_text, target_language='en')
-                            print(f"English: {translated['translatedText']}", flush=True)
+                            english_text = translated['translatedText']
+                            print(f"English: {english_text}", flush=True)
+                            
+                            # Query Gemini for response and speak it back
+                            if call_sid:
+                                gemini_response = query_gemini(english_text)
+                                speak_response(call_sid, gemini_response)
                         elif result.is_interim:
                             # Log interim results for debugging
                             print(f"  [interim] {result.alternatives[0].transcript}", flush=True)
@@ -110,11 +180,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 if error_code == 499:
                     print("Speech stream closed (checking if more audio pending)", flush=True)
                     # Check if audio_queue still has data (more utterances coming)
-                    # if audio_queue.empty():
-                    #     print("No more audio, exiting speech thread", flush=True)
-                        # break
-                    # else:
-                    print("Restarting stream for next utterance", flush=True)
+                    if audio_queue.empty():
+                        import time
+                        time.sleep(0.5) # Wait briefly for more audio
+                        continue
+                    else:
+                        print("Restarting stream for next utterance", flush=True)
                     continue
                 else:
                     print(f"Speech Loop Error: {e}", flush=True)
@@ -127,12 +198,18 @@ async def websocket_endpoint(websocket: WebSocket):
             message = await websocket.receive_text()
             # print(f"WebSocket message received: {message[:200]}", flush=True)
             data = json.loads(message)
-            # print(f"WebSocket event: {data.get('event')}", flush=True)
-            if data['event'] == 'media':
+            event_type = data.get('event')
+            # print(f"WebSocket event: {event_type}", flush=True)
+            
+            if event_type == 'start':
+                # Capture call SID from Twilio metadata
+                call_sid = data.get('start', {}).get('callSid')
+                print(f"Call started: {call_sid}", flush=True)
+            elif event_type == 'media':
                 payload = base64.b64decode(data['media']['payload'])
                 # print(f"Media payload received: {len(payload)} bytes", flush=True)
                 audio_queue.put(payload)
-            if data['event'] == 'stop':
+            elif event_type == 'stop':
                 print("Twilio stop event received", flush=True)
                 break
     except Exception as e:
