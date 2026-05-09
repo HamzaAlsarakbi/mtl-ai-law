@@ -1,13 +1,16 @@
 from config import gemini_model
 
 
-def query_gemini(user_text: str) -> str:
+def query_gemini(user_text: str, language_code: str = "en-US") -> str:
     """Query Gemini for a legal response based on user input."""
     try:
-        print(f"[llm] Querying Gemini with: {user_text}", flush=True)
+        print(f"[llm] Querying Gemini with: {user_text} (respond in {language_code})", flush=True)
         response = gemini_model.generate_content(
             f"""You are a helpful legal information assistant for Montreal.
-The user asked: {user_text}
+The user asked (in English translation): {user_text}
+
+IMPORTANT: Respond in the language with BCP-47 code "{language_code}".
+If the code is "fr-FR" or "fr-CA", respond in French. If "ar-SA" or "ar-XA", respond in Arabic. If "es-ES", respond in Spanish. Otherwise respond in English.
 
 Provide a brief, conversational response (under 100 words) addressing their legal question.
 Do not provide legal advice; provide general legal information and suggest they consult a lawyer."""

@@ -77,6 +77,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "conversation_history": [],
                     "intake_stage": "greeting",
                     "stream_sid": stream_sid,
+                    "is_speaking": False,
                 }
                 print(f"[main] start: callSid={call_sid} streamSid={stream_sid}", flush=True)
             elif event_type == "media":
