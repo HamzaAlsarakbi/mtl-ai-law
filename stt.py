@@ -64,7 +64,7 @@ def _process_utterance(call_sid: str, user_text: str, detected_lang: str, websoc
 
     # Get stage response
     response = handle_stage(call_sid, english_text, detected_lang)
-    speak_response(call_sid, response, websocket, loop)
+    speak_response(call_sid, response, websocket, loop, language_code=detected_lang)
 
     # If stage just moved to waiting_oj, call OpenJustice now (blocking — "please wait" already spoken)
     session = sessions.get(call_sid)
@@ -76,7 +76,7 @@ def _process_utterance(call_sid: str, user_text: str, detected_lang: str, websoc
         session["oj_result"] = oj_result
         session["intake_stage"] = "explaining"
         explanation = generate_oj_explanation(oj_result, session)
-        speak_response(call_sid, explanation, websocket, loop)
+        speak_response(call_sid, explanation, websocket, loop, language_code=detected_lang)
 
     # If user agreed to SMS, send it
     session = sessions.get(call_sid)
@@ -108,9 +108,16 @@ def run_recognition_loop(audio_queue: queue.Queue, call_sid_ref: list, websocket
                     if result.is_final:
                         call_sid = call_sid_ref[0]
 
-                        # Suppress while TTS is playing to break the echo feedback loop
-                        if call_sid and sessions.get(call_sid, {}).get("is_speaking"):
+                        session_state = sessions.get(call_sid, {})
+
+                        # Suppress while TTS is playing (echo guard)
+                        if call_sid and session_state.get("is_speaking"):
                             print("[stt] Suppressed (TTS playing)", flush=True)
+                            continue
+
+                        # Suppress during greeting — caller speech would collide
+                        if call_sid and session_state.get("intake_stage") == "greeting":
+                            print("[stt] Suppressed (greeting in progress)", flush=True)
                             continue
 
                         user_text = result.alternatives[0].transcript

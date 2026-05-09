@@ -89,7 +89,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 sessions[call_sid] = {
                     "language": "en-US",
                     "conversation_history": [],
-                    "intake_stage": "situation",  # greeting fires immediately below
+                    "intake_stage": "greeting",  # blocks STT until greeting finishes
                     "stream_sid": stream_sid,
                     "is_speaking": False,
                     "situation_raw": None,
@@ -128,46 +128,63 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 def _play_greeting(call_sid: str, websocket, loop) -> None:
-    """Play the 3-part scripted opening with pauses, matching idea.txt flow:
-    1. Emergency disclaimer  →  5s pause
-    2. AI disclaimer         →  5s pause
-    3. Situation prompt      →  listen
+    """Play the 3-part scripted opening.
+
+    Stage is "greeting" during this entire sequence — the STT thread discards
+    any speech it picks up until we set the stage to "situation" at the end.
+
+    1. Emergency disclaimer  →  2s pause
+    2. AI disclaimer         →  2s pause
+    3. Situation prompt      →  stage → "situation", STT now active
     """
     import time
-    time.sleep(0.8)  # let stream stabilize
+    time.sleep(0.8)  # let Twilio stream stabilize
 
     session = sessions.get(call_sid)
     if not session:
         return
 
-    # Part 1 — emergency disclaimer
-    emergency = (
-        "Welcome to JusticeLine. / Bienvenue à JusticeLine. / مرحباً بك في JusticeLine. "
-        "If this is an emergency, hang up and dial 9-1-1 immediately."
+    # Part 1 — emergency disclaimer (English — clear, no garbled multilingual TTS)
+    speak_response(
+        call_sid,
+        "Welcome to JusticeLine. "
+        "If this is an emergency, please hang up and dial 9-1-1. "
+        "You can speak to me in any language — English, French, Arabic, Spanish, or others.",
+        websocket,
+        loop,
     )
-    print(f"[main] Greeting part 1 for {call_sid}", flush=True)
-    speak_response(call_sid, emergency, websocket, loop)
-    time.sleep(5)
+    time.sleep(2)
 
     if call_sid not in sessions:
         return
 
     # Part 2 — AI disclaimer
-    ai_disclaimer = (
-        "This is an AI-powered legal helpline. It is prone to error. "
-        "Please stay on the line if you understand and accept this."
+    speak_response(
+        call_sid,
+        "This is an AI-powered legal helpline. I am not a lawyer. "
+        "Information I provide is general only and may contain errors. "
+        "Please stay on the line if you understand.",
+        websocket,
+        loop,
     )
-    print(f"[main] Greeting part 2 for {call_sid}", flush=True)
-    speak_response(call_sid, ai_disclaimer, websocket, loop)
-    time.sleep(5)
+    time.sleep(2)
 
     if call_sid not in sessions:
         return
 
-    # Part 3 — situation prompt
-    situation_prompt = "Please tell me about your legal situation."
-    print(f"[main] Greeting part 3 for {call_sid}", flush=True)
-    speak_response(call_sid, situation_prompt, websocket, loop)
+    # Part 3 — open situation prompt, then unlock STT
+    speak_response(
+        call_sid,
+        "Please tell me about your legal situation.",
+        websocket,
+        loop,
+    )
+
+    # Greeting complete — allow STT to process caller speech
+    session = sessions.get(call_sid)
+    if session:
+        session["intake_stage"] = "situation"
+        print(f"[main] Greeting done for {call_sid}, STT now active", flush=True)
 
 
 if __name__ == "__main__":

@@ -81,7 +81,7 @@ def synthesize_mulaw(text: str, language_code: str = "en-US") -> bytes:
     return _strip_wav_header(response.audio_content)
 
 
-def speak_response(call_sid: str, text: str, websocket, loop) -> None:
+def speak_response(call_sid: str, text: str, websocket, loop, language_code: str | None = None) -> None:
     """Synthesize TTS + inject audio over the Twilio Media Stream WebSocket.
 
     Called from the STT worker thread. Uses asyncio.run_coroutine_threadsafe
@@ -97,7 +97,7 @@ def speak_response(call_sid: str, text: str, websocket, loop) -> None:
         print(f"[tts] No session for {call_sid}, skipping", flush=True)
         return
     stream_sid = session.get("stream_sid")
-    language = session.get("language", "en-US")
+    language = language_code or session.get("language", "en-US")
     if not stream_sid:
         print(f"[tts] No stream_sid for {call_sid}, skipping", flush=True)
         return
