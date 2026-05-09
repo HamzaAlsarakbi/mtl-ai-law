@@ -24,7 +24,7 @@ from sms import send_sms_resources
 
 print("[main] JusticeLine starting (Gemini Live mode)", flush=True)
 
-MODEL = "gemini-2.0-flash-live-001"
+MODEL = "gemini-live-2.5-flash-native-audio"
 
 SYSTEM_INSTRUCTION = """You are JusticeLine, a multilingual legal information AI assistant for Quebec, Canada.
 
@@ -237,4 +237,13 @@ async def media_stream(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    import sys
+
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    except KeyboardInterrupt:
+        print("[main] Shutdown requested (KeyboardInterrupt)", flush=True)
+        sys.exit(0)
+    except Exception as e:
+        print(f"[main] uvicorn.run raised an exception: {e}", flush=True)
+        raise
