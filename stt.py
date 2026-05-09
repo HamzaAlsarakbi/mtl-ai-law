@@ -1,7 +1,9 @@
 import queue
 from google.cloud import speech
 from config import speech_client, translate_client, sessions
-from llm import query_gemini
+from llm import handle_stage, generate_oj_explanation
+from openjustice import query_openjustice
+from sms import send_sms_resources
 from tts import speak_response
 
 
@@ -10,7 +12,7 @@ def _make_streaming_config() -> speech.StreamingRecognitionConfig:
         encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
         sample_rate_hertz=8000,
         language_code="en-US",
-        alternative_language_codes=["fr-FR", "es-ES", "ar-SA"],
+        alternative_language_codes=["fr-CA", "fr-FR", "ar-SA", "ar-XA", "es-ES", "pt-BR", "zh-CN", "hi-IN"],
         enable_automatic_punctuation=True,
     )
     return speech.StreamingRecognitionConfig(
@@ -33,18 +35,59 @@ def _request_generator(audio_queue: queue.Queue):
         yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
 
+def _to_english(text: str) -> str:
+    """Translate any text to English for stage processing."""
+    try:
+        result = translate_client.translate(text, target_language="en")
+        return result["translatedText"]
+    except Exception:
+        return text
+
+
+def _process_utterance(call_sid: str, user_text: str, detected_lang: str, websocket, loop) -> None:
+    """Handle one complete utterance through the intake state machine."""
+    english_text = _to_english(user_text)
+    print(f"[stt] English: {english_text!r}", flush=True)
+
+    session = sessions.get(call_sid)
+    if not session:
+        print(f"[stt] No session for {call_sid}", flush=True)
+        return
+
+    # Update language from this utterance (more accurate over time)
+    session["language"] = detected_lang
+
+    # Append user turn to history
+    session["conversation_history"].append(
+        {"role": "user", "text": user_text, "lang": detected_lang}
+    )
+
+    # Get stage response
+    response = handle_stage(call_sid, english_text, detected_lang)
+    speak_response(call_sid, response, websocket, loop)
+
+    # If stage just moved to waiting_oj, call OpenJustice now (blocking — "please wait" already spoken)
+    session = sessions.get(call_sid)
+    if session and session.get("intake_stage") == "waiting_oj":
+        oj_result = query_openjustice(
+            session.get("situation_raw", ""),
+            session.get("jurisdiction", ""),
+        )
+        session["oj_result"] = oj_result
+        session["intake_stage"] = "explaining"
+        explanation = generate_oj_explanation(oj_result, session)
+        speak_response(call_sid, explanation, websocket, loop)
+
+    # If user agreed to SMS, send it
+    session = sessions.get(call_sid)
+    if session and session.pop("send_sms", False):
+        caller_number = session.get("caller_number")
+        lang = session.get("language", "en-US")
+        send_sms_resources(caller_number, lang)
+
+
 def run_recognition_loop(audio_queue: queue.Queue, call_sid_ref: list, websocket, loop) -> None:
-    """
-    Runs STT in a loop, restarting the stream as needed.
-
-    call_sid_ref is a one-element list so the websocket handler can mutate it
-    after this thread starts (call SID arrives on the 'start' event).
-
-    websocket + loop are passed through to speak_response so it can use
-    asyncio.run_coroutine_threadsafe to send audio back over the WebSocket
-    from this worker thread (per RESEARCH Pattern 2 — never call
-    await websocket.send_text from a non-asyncio thread).
-    """
+    """STT worker thread — streams audio to Google, processes final transcripts."""
     print("[stt] Recognition loop starting", flush=True)
     streaming_config = _make_streaming_config()
 
@@ -58,56 +101,37 @@ def run_recognition_loop(audio_queue: queue.Queue, call_sid_ref: list, websocket
 
             for response in responses:
                 if response.speech_event_type == speech.StreamingRecognizeResponse.SpeechEventType.END_OF_SINGLE_UTTERANCE:
-                    print("[stt] --- End of utterance detected ---", flush=True)
+                    print("[stt] --- End of utterance ---", flush=True)
                     continue
 
                 for result in response.results:
                     if result.is_final:
                         call_sid = call_sid_ref[0]
 
-                        # Suppress processing while TTS is playing to break feedback loop.
-                        # STT hears our own TTS output — without this guard the system
-                        # transcribes its own speech and responds forever.
+                        # Suppress while TTS is playing to break the echo feedback loop
                         if call_sid and sessions.get(call_sid, {}).get("is_speaking"):
-                            print("[stt] Suppressed (TTS playing), discarding result", flush=True)
+                            print("[stt] Suppressed (TTS playing)", flush=True)
                             continue
 
                         user_text = result.alternatives[0].transcript
                         confidence = result.alternatives[0].confidence
                         detected_lang = result.language_code or "en-US"
-                        print(f"[stt] Detected: '{user_text}' lang={detected_lang} (conf: {confidence:.2f})", flush=True)
-
-                        # Write detected language to session immediately (per D-02).
-                        if call_sid and call_sid in sessions:
-                            sessions[call_sid]["language"] = detected_lang
-                            sessions[call_sid]["conversation_history"].append(
-                                {"role": "user", "text": user_text, "lang": detected_lang}
-                            )
-
-                        if confidence < 0.5 and len(result.alternatives) > 1:
-                            alt = result.alternatives[1]
-                            print(f"[stt]   Alternative: '{alt.transcript}' (conf: {alt.confidence:.2f})", flush=True)
-
-                        translated = translate_client.translate(user_text, target_language="en")
-                        english_text = translated["translatedText"]
-                        print(f"[stt] English: {english_text}", flush=True)
+                        print(f"[stt] Final: {user_text!r} lang={detected_lang} conf={confidence:.2f}", flush=True)
 
                         if call_sid:
-                            gemini_response = query_gemini(english_text, detected_lang)
-                            speak_response(call_sid, gemini_response, websocket, loop)
+                            _process_utterance(call_sid, user_text, detected_lang, websocket, loop)
                         else:
-                            print("[stt] No call SID yet, skipping response", flush=True)
+                            print("[stt] No call SID yet, skipping", flush=True)
 
                     elif result.is_interim:
-                        print(f"[stt]   [interim] {result.alternatives[0].transcript}", flush=True)
+                        print(f"[stt]   [interim] {result.alternatives[0].transcript!r}", flush=True)
 
         except Exception as e:
             error_code = getattr(e, "code", None)
             if error_code == 499:
-                print("[stt] Speech stream closed (checking if more audio pending)", flush=True)
-                import time
-                time.sleep(0.5)
+                print("[stt] Speech stream closed (CANCELLED) — restarting", flush=True)
+                import time; time.sleep(0.5)
                 continue
             else:
-                print(f"[stt] Speech loop error: {e}", flush=True)
+                print(f"[stt] Fatal speech loop error: {e}", flush=True)
                 break
