@@ -22,6 +22,7 @@ async def twilio_webhook():
         <Say>Please describe your legal situation.</Say>
         <Connect>
             <Stream url="wss://{DOMAIN}/media" />
+            <Pause length="600" />
         </Connect>
     </Response>
     """
