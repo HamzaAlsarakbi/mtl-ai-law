@@ -1,38 +1,93 @@
+"""JusticeLine — Twilio + Gemini Live API.
+
+Audio pipeline (single bidirectional stream — no separate STT/TTS):
+  Twilio MULAW 8kHz → upsample → PCM 16kHz → Gemini Live
+  Gemini Live PCM 24kHz → downsample → MULAW 8kHz → Twilio
+"""
 import asyncio
 import base64
 import json
-import queue
-import threading
+import os
 
-from fastapi import FastAPI, WebSocket, Request, Response
+try:
+    import audioop
+except ImportError:
+    import audioop_lts as audioop  # Python 3.13+ fallback
 
-from config import DOMAIN, sessions
-from stt import run_recognition_loop
-from tts import speak_response
+from fastapi import FastAPI, Request, Response, WebSocket
+from google import genai
+from google.genai import types
 
-print("[main] Starting JusticeLine API", flush=True)
+from config import PROJECT_ID, LOCATION, DOMAIN
+from openjustice import query_openjustice
+from sms import send_sms_resources
+
+print("[main] JusticeLine starting (Gemini Live mode)", flush=True)
+
+MODEL = "gemini-2.0-flash-live-001"
+
+SYSTEM_INSTRUCTION = """You are JusticeLine, a multilingual legal information AI assistant for Quebec, Canada.
+
+CRITICAL RULES:
+- You are NOT a lawyer. Provide general legal information only — never specific legal advice.
+- For life-threatening emergencies, immediately tell the caller to hang up and dial 911.
+- Detect the caller's language from their first words and respond in that language throughout the entire call.
+- Keep every response under 80 words. Speak naturally and conversationally — no lists, no markdown.
+
+CALL FLOW — follow this order exactly:
+1. Greet the caller warmly. State this is not an emergency service (call 911 for emergencies). State you are an AI, not a lawyer. Ask them to describe their legal situation.
+2. Listen. Then ask: "Where are you located? City or province?"
+3. Ask ONE clarifying question if the situation is unclear.
+4. Once you have both their situation and location, call query_legal_database immediately.
+5. While the database is loading, say "Please wait a moment while I look up the relevant legal information."
+6. When you receive the legal guidance, explain it in plain language in the caller's language.
+7. Ask if they have follow-up questions. Answer up to 5.
+8. Offer to send SMS resources: Juripop (juripop.org, free legal consultations) and Aide juridique (1-800-842-2213).
+9. If they want SMS, call send_sms_resources.
+10. Say a warm goodbye in the caller's language."""
+
+_TOOLS = types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="query_legal_database",
+        description="Query the OpenJustice legal database. Call this when you have collected the caller's legal situation and location.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "situation": types.Schema(type=types.Type.STRING, description="The caller's legal situation (summarized in English)"),
+                "jurisdiction": types.Schema(type=types.Type.STRING, description="The caller's location — city or province"),
+            },
+            required=["situation", "jurisdiction"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="send_sms_resources",
+        description="Send an SMS with legal resource phone numbers and links to the caller",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={},
+        ),
+    ),
+])
+
 app = FastAPI()
 
-# Temporary store: callSid → caller phone number, populated by /twilio-webhook
-# before the WebSocket start event arrives.
-_pending_caller_numbers: dict[str, str] = {}
+# CallSid → caller's From number (captured at webhook, consumed at WebSocket start)
+_pending_callers: dict[str, str] = {}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "JusticeLine", "mode": "gemini-live"}
 
 
 @app.post("/twilio-webhook")
 async def twilio_webhook(request: Request):
-    """Initial entry point for Twilio calls.
-
-    Captures From number here because the WebSocket 'start' event
-    doesn't include it. Returns TwiML with <Connect><Stream> for
-    bidirectional audio (NOT <Start><Stream> which is one-way).
-    The <Pause length="600"> keeps the call alive for up to 10 min.
-    """
-    form_data = await request.form()
-    call_sid = form_data.get("CallSid", "")
-    from_number = form_data.get("From", "")
+    form = await request.form()
+    call_sid = form.get("CallSid", "")
+    from_number = form.get("From", "")
     if call_sid:
-        _pending_caller_numbers[call_sid] = from_number
-        print(f"[main] Incoming call: CallSid={call_sid} From={from_number}", flush=True)
+        _pending_callers[call_sid] = from_number
+        print(f"[main] Incoming call: {call_sid} from {from_number}", flush=True)
 
     stream_url = f"wss://{DOMAIN}/media"
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -41,152 +96,138 @@ async def twilio_webhook(request: Request):
         <Stream url="{stream_url}" />
     </Connect>
     <Pause length="600" />
-</Response>
-"""
+</Response>"""
     return Response(content=twiml, media_type="text/xml")
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "JusticeLine"}
+def _audio_twilio_to_gemini(chunk: bytes, state) -> tuple[bytes, object]:
+    """Twilio MULAW 8kHz → PCM 16kHz for Gemini Live input."""
+    pcm_8k = audioop.ulaw2lin(chunk, 2)
+    pcm_16k, new_state = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, state)
+    return pcm_16k, new_state
+
+
+def _audio_gemini_to_twilio(audio_data: bytes, state) -> tuple[str, object]:
+    """Gemini Live PCM 24kHz → MULAW 8kHz base64 for Twilio."""
+    pcm_8k, new_state = audioop.ratecv(audio_data, 2, 1, 24000, 8000, state)
+    mulaw = audioop.lin2ulaw(pcm_8k, 2)
+    return base64.b64encode(mulaw).decode("utf-8"), new_state
+
+
+async def _handle_tool_call(fc_name: str, fc_args: dict, caller_number: str | None) -> str:
+    loop = asyncio.get_running_loop()
+    if fc_name == "query_legal_database":
+        situation = fc_args.get("situation", "")
+        jurisdiction = fc_args.get("jurisdiction", "")
+        print(f"[tool] query_legal_database: {situation[:80]!r} | {jurisdiction!r}", flush=True)
+        result = await loop.run_in_executor(None, query_openjustice, situation, jurisdiction)
+        return result
+    if fc_name == "send_sms_resources":
+        print(f"[tool] send_sms_resources: to={caller_number}", flush=True)
+        if caller_number:
+            sent = await loop.run_in_executor(None, send_sms_resources, caller_number)
+            return "SMS sent successfully" if sent else "SMS could not be delivered"
+        return "No caller phone number available"
+    return f"Unknown function: {fc_name}"
 
 
 @app.websocket("/media")
-async def websocket_endpoint(websocket: WebSocket):
-    """Bidirectional Twilio Media Stream handler.
-
-    Captures the asyncio event loop so the STT worker thread can dispatch
-    audio sends back via asyncio.run_coroutine_threadsafe. Plays the
-    trilingual greeting immediately on connect (before the caller speaks).
-    """
-    print(f"[main] WebSocket handshake from {websocket.client}", flush=True)
+async def media_stream(websocket: WebSocket):
     await websocket.accept()
-    loop = asyncio.get_running_loop()
-    print("[main] WebSocket connection established", flush=True)
+    print("[main] WebSocket accepted", flush=True)
 
-    audio_queue: queue.Queue = queue.Queue()
-    call_sid_ref: list = [None]  # mutable so STT thread sees callSid once 'start' arrives
+    call_sid: str | None = None
+    stream_sid: str | None = None
+    caller_number: str | None = None
+    audio_buffer = bytearray()
+    upsample_state = None
+    downsample_state = None
 
-    threading.Thread(
-        target=run_recognition_loop,
-        args=(audio_queue, call_sid_ref, websocket, loop),
-        daemon=True,
-    ).start()
-
-    try:
-        while True:
-            message = await websocket.receive_text()
-            data = json.loads(message)
-            event_type = data.get("event")
-
-            if event_type == "start":
-                start = data.get("start", {})
-                call_sid = start.get("callSid")
-                stream_sid = start.get("streamSid")
-                call_sid_ref[0] = call_sid
-
-                caller_number = _pending_caller_numbers.pop(call_sid, None)
-                sessions[call_sid] = {
-                    "language": "en-US",
-                    "conversation_history": [],
-                    "intake_stage": "greeting",  # blocks STT until greeting finishes
-                    "stream_sid": stream_sid,
-                    "is_speaking": False,
-                    "situation_raw": None,
-                    "jurisdiction": None,
-                    "oj_result": None,
-                    "followup_count": 0,
-                    "caller_number": caller_number,
-                    "send_sms": False,
-                }
-                print(f"[main] start: callSid={call_sid} streamSid={stream_sid} from={caller_number}", flush=True)
-
-                # Play trilingual greeting without blocking the WebSocket receive loop
-                threading.Thread(
-                    target=_play_greeting,
-                    args=(call_sid, websocket, loop),
-                    daemon=True,
-                ).start()
-
-            elif event_type == "media":
-                payload = base64.b64decode(data["media"]["payload"])
-                audio_queue.put(payload)
-
-            elif event_type == "stop":
-                print("[main] Twilio stop event received", flush=True)
-                break
-
-    except Exception as e:
-        print(f"[main] WebSocket loop error: {e}", flush=True)
-    finally:
-        call_sid = call_sid_ref[0]
-        if call_sid and call_sid in sessions:
-            del sessions[call_sid]
-            print(f"[main] Session cleaned up for {call_sid}", flush=True)
-        print("[main] WebSocket closing, signaling speech thread", flush=True)
-        audio_queue.put(None)
-
-
-def _play_greeting(call_sid: str, websocket, loop) -> None:
-    """Play the 3-part scripted opening.
-
-    Stage is "greeting" during this entire sequence — the STT thread discards
-    any speech it picks up until we set the stage to "situation" at the end.
-
-    1. Emergency disclaimer  →  2s pause
-    2. AI disclaimer         →  2s pause
-    3. Situation prompt      →  stage → "situation", STT now active
-    """
-    import time
-    time.sleep(0.8)  # let Twilio stream stabilize
-
-    session = sessions.get(call_sid)
-    if not session:
-        return
-
-    # Part 1 — emergency disclaimer (English — clear, no garbled multilingual TTS)
-    speak_response(
-        call_sid,
-        "Welcome to JusticeLine. "
-        "If this is an emergency, please hang up and dial 9-1-1. "
-        "You can speak to me in any language — English, French, Arabic, Spanish, or others.",
-        websocket,
-        loop,
-    )
-    time.sleep(2)
-
-    if call_sid not in sessions:
-        return
-
-    # Part 2 — AI disclaimer
-    speak_response(
-        call_sid,
-        "This is an AI-powered legal helpline. I am not a lawyer. "
-        "Information I provide is general only and may contain errors. "
-        "Please stay on the line if you understand.",
-        websocket,
-        loop,
-    )
-    time.sleep(2)
-
-    if call_sid not in sessions:
-        return
-
-    # Part 3 — open situation prompt, then unlock STT
-    speak_response(
-        call_sid,
-        "Please tell me about your legal situation.",
-        websocket,
-        loop,
+    client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+    live_config = types.LiveConnectConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        response_modalities=["AUDIO"],
+        tools=[_TOOLS],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+            )
+        ),
     )
 
-    # Greeting complete — allow STT to process caller speech
-    session = sessions.get(call_sid)
-    if session:
-        session["intake_stage"] = "situation"
-        print(f"[main] Greeting done for {call_sid}, STT now active", flush=True)
+    async with client.aio.live.connect(model=MODEL, config=live_config) as session:
+
+        async def _receiver():
+            nonlocal downsample_state, stream_sid
+            try:
+                async for response in session.receive():
+                    # Audio from Gemini → forward to Twilio
+                    if (response.server_content
+                            and response.server_content.model_turn):
+                        for part in response.server_content.model_turn.parts:
+                            if part.inline_data and part.inline_data.data:
+                                b64, downsample_state = _audio_gemini_to_twilio(
+                                    part.inline_data.data, downsample_state
+                                )
+                                if stream_sid:
+                                    await websocket.send_json({
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {"payload": b64},
+                                    })
+
+                    # Function call from Gemini → execute → return result
+                    if response.tool_call:
+                        for fc in response.tool_call.function_calls:
+                            result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
+                            await session.send(
+                                input=types.LiveClientToolResponse(
+                                    function_responses=[types.FunctionResponse(
+                                        name=fc.name,
+                                        id=fc.id,
+                                        response={"result": result},
+                                    )]
+                                )
+                            )
+            except Exception as e:
+                print(f"[gemini] receiver error: {e}", flush=True)
+
+        receiver_task = asyncio.create_task(_receiver())
+
+        try:
+            async for message in websocket.iter_text():
+                data = json.loads(message)
+                event = data.get("event")
+
+                if event == "start":
+                    call_sid = data["start"]["callSid"]
+                    stream_sid = data["start"]["streamSid"]
+                    caller_number = _pending_callers.pop(call_sid, None)
+                    print(f"[main] start: {call_sid} stream={stream_sid} from={caller_number}", flush=True)
+
+                elif event == "media":
+                    chunk = base64.b64decode(data["media"]["payload"])
+                    pcm_16k, upsample_state = _audio_twilio_to_gemini(chunk, upsample_state)
+                    audio_buffer.extend(pcm_16k)
+                    # Send ~300ms chunks (9600 bytes @ 16kHz stereo-mono)
+                    if len(audio_buffer) >= 9600:
+                        await session.send(
+                            input={"data": bytes(audio_buffer), "mime_type": "audio/pcm;rate=16000"},
+                            end_of_turn=False,
+                        )
+                        audio_buffer.clear()
+
+                elif event == "stop":
+                    print(f"[main] stop event for {call_sid}", flush=True)
+                    break
+
+        except Exception as e:
+            print(f"[main] WebSocket error: {e}", flush=True)
+        finally:
+            receiver_task.cancel()
+            print(f"[main] Session closed for {call_sid}", flush=True)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))

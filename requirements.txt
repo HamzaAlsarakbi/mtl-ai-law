@@ -1,12 +1,10 @@
 fastapi
 uvicorn
-google-cloud-speech
-google-cloud-translate
+google-genai
 google-cloud-aiplatform
-google-cloud-texttospeech
-google-cloud-storage
 twilio
-vertexai
 python-dotenv
 requests
 pytest
+python-multipart
+audioop-lts
