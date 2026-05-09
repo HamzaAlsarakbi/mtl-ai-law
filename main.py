@@ -17,13 +17,13 @@ DOMAIN = "openjustice-agent-966017992454.us-central1.run.app"
 @app.post("/twilio-webhook")
 async def twilio_webhook():
     """Initial entry point for Twilio calls."""
-    twiml = f"""
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Say>Please describe your legal situation.</Say>
         <Connect>
             <Stream url="wss://{DOMAIN}/media" />
-            <Pause length="600" />
         </Connect>
+        <Pause length="600" />
     </Response>
     """
     return Response(content=twiml, media_type="application/xml")
