@@ -1,3 +1,10 @@
 .venv
 hackathon-key.json
 .env
+.planning/
+*.json
+!package.json
+!package-lock.json
+
+
+__pycache__/
