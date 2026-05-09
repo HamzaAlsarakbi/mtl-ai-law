@@ -5,3 +5,6 @@ hackathon-key.json
 *.json
 !package.json
 !package-lock.json
+
+
+__pycache__/
