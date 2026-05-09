@@ -8,15 +8,17 @@ import asyncio
 import base64
 import json
 import os
+import traceback
+from importlib import import_module
 
 try:
     import audioop
 except ImportError:
-    import audioop_lts as audioop  # Python 3.13+ fallback
+    audioop = import_module("audioop_lts")  # Python 3.13+ fallback
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 from config import PROJECT_ID, LOCATION, DOMAIN
 from openjustice import query_openjustice
@@ -61,10 +63,15 @@ _TOOLS = types.Tool(function_declarations=[
     ),
     types.FunctionDeclaration(
         name="send_sms_resources",
-        description="Send an SMS with legal resource phone numbers and links to the caller",
+        description="Send an SMS with legal resource phone numbers and links to the caller. Call this only after the caller has agreed to receive an SMS.",
         parameters=types.Schema(
             type=types.Type.OBJECT,
-            properties={},
+            properties={
+                "language_code": types.Schema(
+                    type=types.Type.STRING,
+                    description="BCP-47 language code matching the caller's language, e.g. 'en', 'fr', 'ar', 'es'. Use 'en' if unsure.",
+                ),
+            },
         ),
     ),
 ])
@@ -123,9 +130,10 @@ async def _handle_tool_call(fc_name: str, fc_args: dict, caller_number: str | No
         result = await loop.run_in_executor(None, query_openjustice, situation, jurisdiction)
         return result
     if fc_name == "send_sms_resources":
-        print(f"[tool] send_sms_resources: to={caller_number}", flush=True)
+        language_code = fc_args.get("language_code") or "en"
+        print(f"[tool] send_sms_resources: to={caller_number} lang={language_code}", flush=True)
         if caller_number:
-            sent = await loop.run_in_executor(None, send_sms_resources, caller_number)
+            sent = await loop.run_in_executor(None, send_sms_resources, caller_number, language_code)
             return "SMS sent successfully" if sent else "SMS could not be delivered"
         return "No caller phone number available"
     return f"Unknown function: {fc_name}"
@@ -139,9 +147,9 @@ async def media_stream(websocket: WebSocket):
     call_sid: str | None = None
     stream_sid: str | None = None
     caller_number: str | None = None
-    audio_buffer = bytearray()
     upsample_state = None
     downsample_state = None
+    greeted = False
 
     client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
     live_config = types.LiveConnectConfig(
@@ -153,45 +161,59 @@ async def media_stream(websocket: WebSocket):
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
             )
         ),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
     )
 
     try:
         async with client.aio.live.connect(model=MODEL, config=live_config) as session:
 
             async def _receiver():
-                nonlocal downsample_state, stream_sid
+                nonlocal downsample_state
                 try:
-                    async for response in session.receive():
-                        # Audio from Gemini → forward to Twilio
-                        if (response.server_content
-                                and response.server_content.model_turn):
-                            for part in response.server_content.model_turn.parts:
-                                if part.inline_data and part.inline_data.data:
-                                    b64, downsample_state = _audio_gemini_to_twilio(
-                                        part.inline_data.data, downsample_state
-                                    )
-                                    if stream_sid:
-                                        await websocket.send_json({
-                                            "event": "media",
-                                            "streamSid": stream_sid,
-                                            "media": {"payload": b64},
-                                        })
+                    while True:
+                        async for response in session.receive():
+                            sc = response.server_content
+                            if sc:
+                                if sc.input_transcription and sc.input_transcription.text:
+                                    print(f"[user] {sc.input_transcription.text}", flush=True)
+                                if sc.output_transcription and sc.output_transcription.text:
+                                    print(f"[bot]  {sc.output_transcription.text}", flush=True)
+                                if sc.model_turn:
+                                    for part in sc.model_turn.parts:
+                                        if part.inline_data and part.inline_data.data:
+                                            b64, downsample_state = _audio_gemini_to_twilio(
+                                                part.inline_data.data, downsample_state
+                                            )
+                                            if stream_sid:
+                                                await websocket.send_json({
+                                                    "event": "media",
+                                                    "streamSid": stream_sid,
+                                                    "media": {"payload": b64},
+                                                })
+                                if sc.interrupted:
+                                    print("[gemini] turn interrupted by caller", flush=True)
 
-                        # Function call from Gemini → execute → return result
-                        if response.tool_call:
-                            for fc in response.tool_call.function_calls:
-                                result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
-                                await session.send(
-                                    input=types.LiveClientToolResponse(
+                            if response.tool_call:
+                                for fc in response.tool_call.function_calls:
+                                    result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
+                                    await session.send_tool_response(
                                         function_responses=[types.FunctionResponse(
                                             name=fc.name,
                                             id=fc.id,
                                             response={"result": result},
                                         )]
                                     )
-                                )
-                except Exception as e:
-                    print(f"[gemini] receiver error: {e}", flush=True)
+
+                            if response.go_away:
+                                print(f"[gemini] go_away: {response.go_away}", flush=True)
+                except asyncio.CancelledError:
+                    raise
+                except errors.APIError as e:
+                    print(f"[gemini] APIError: code={getattr(e, 'code', None)} {e}", flush=True)
+                except Exception:
+                    print("[gemini] receiver crashed:", flush=True)
+                    traceback.print_exc()
 
             receiver_task = asyncio.create_task(_receiver())
 
@@ -206,29 +228,42 @@ async def media_stream(websocket: WebSocket):
                         caller_number = _pending_callers.pop(call_sid, None)
                         print(f"[main] start: {call_sid} stream={stream_sid} from={caller_number}", flush=True)
 
+                        if not greeted:
+                            greeted = True
+                            # Live API does not auto-greet — kick off step 1 of the call flow.
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text="The caller just connected. Begin step 1 now: greet them, state this is not 911 and you are an AI not a lawyer, then ask them to describe their legal situation.")],
+                                ),
+                                turn_complete=True,
+                            )
+
                     elif event == "media":
                         chunk = base64.b64decode(data["media"]["payload"])
                         pcm_16k, upsample_state = _audio_twilio_to_gemini(chunk, upsample_state)
-                        audio_buffer.extend(pcm_16k)
-                        # Send ~300ms chunks (9600 bytes @ 16kHz stereo-mono)
-                        if len(audio_buffer) >= 9600:
-                            await session.send(
-                                input={"data": bytes(audio_buffer), "mime_type": "audio/pcm;rate=16000"},
-                                end_of_turn=False,
+                        if pcm_16k:
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=pcm_16k, mime_type="audio/pcm;rate=16000"),
                             )
-                            audio_buffer.clear()
 
                     elif event == "stop":
                         print(f"[main] stop event for {call_sid}", flush=True)
                         break
 
-            except Exception as e:
-                print(f"[main] WebSocket error: {e}", flush=True)
+            except Exception:
+                print("[main] WebSocket error:", flush=True)
+                traceback.print_exc()
             finally:
                 receiver_task.cancel()
+                try:
+                    await receiver_task
+                except (asyncio.CancelledError, Exception):
+                    pass
                 print(f"[main] Session closed for {call_sid}", flush=True)
-    except Exception as e:
-        print(f"[main] Gemini Live connection failed: {e}", flush=True)
+    except Exception:
+        print("[main] Gemini Live connection failed:", flush=True)
+        traceback.print_exc()
         try:
             await websocket.close()
         except Exception:
@@ -239,10 +274,23 @@ if __name__ == "__main__":
     import uvicorn
     import sys
 
+    # PORT 8080 is required for Cloud Run, but we add timeout tweaks for local/ngrok
+    port = int(os.getenv("PORT", "8080"))
+
     try:
-        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+        uvicorn.run(
+            "main:app",             # Using import string for better signal handling
+            host="0.0.0.0", 
+            port=port,
+            # Vital for Gemini Live: Prevents the server from killing "long" connections
+            timeout_keep_alive=75,  
+            # Helps maintain heartbeats over the ngrok tunnel
+            ws_ping_interval=20,    
+            ws_ping_timeout=20,
+            log_level="info"
+        )
     except KeyboardInterrupt:
-        print("[main] Shutdown requested (KeyboardInterrupt)", flush=True)
+        print("\n[main] Shutdown requested (KeyboardInterrupt)", flush=True)
         sys.exit(0)
     except Exception as e:
         print(f"[main] uvicorn.run raised an exception: {e}", flush=True)

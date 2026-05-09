@@ -46,6 +46,7 @@ def _to_english(text: str) -> str:
 
 def _process_utterance(call_sid: str, user_text: str, detected_lang: str, websocket, loop) -> None:
     """Handle one complete utterance through the intake state machine."""
+    print(f"[stt] Processing utterance for {call_sid}: {user_text!r} (lang={detected_lang})", flush=True)
     english_text = _to_english(user_text)
     print(f"[stt] English: {english_text!r}", flush=True)
 
