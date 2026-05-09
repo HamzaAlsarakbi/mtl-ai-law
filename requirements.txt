@@ -8,3 +8,4 @@ google-cloud-storage
 twilio
 vertexai
 python-dotenv
+pytest
