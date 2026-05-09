@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+google-cloud-speech
+google-cloud-translate
+google-cloud-aiplatform
+google-cloud-storage
+twilio
+python-dotenv
