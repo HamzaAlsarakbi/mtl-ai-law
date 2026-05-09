@@ -103,6 +103,7 @@ def speak_response(call_sid: str, text: str, websocket, loop) -> None:
         return
 
     try:
+        session["is_speaking"] = True
         mulaw_bytes = synthesize_mulaw(text, language)
         payload_b64 = base64.b64encode(mulaw_bytes).decode("ascii")
         msg = json.dumps({
@@ -113,9 +114,14 @@ def speak_response(call_sid: str, text: str, websocket, loop) -> None:
         future = asyncio.run_coroutine_threadsafe(websocket.send_text(msg), loop)
         future.result(timeout=5.0)
         print(f"[tts] Sent {len(mulaw_bytes)} mulaw bytes to stream {stream_sid}", flush=True)
-        # Append assistant turn to conversation history (Plan 01 added user turn).
         session["conversation_history"].append(
             {"role": "assistant", "text": text, "lang": language}
         )
+        # Wait for audio to finish playing before re-enabling STT.
+        # Rough estimate: mulaw @ 8000Hz, 1 byte = 1 sample = 125µs.
+        playback_seconds = len(mulaw_bytes) / 8000.0
+        import time; time.sleep(playback_seconds + 0.5)
     except Exception as e:
         print(f"[tts] speak_response error: {e}", flush=True)
+    finally:
+        session["is_speaking"] = False

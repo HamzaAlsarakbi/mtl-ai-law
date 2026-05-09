@@ -63,34 +63,37 @@ def run_recognition_loop(audio_queue: queue.Queue, call_sid_ref: list, websocket
 
                 for result in response.results:
                     if result.is_final:
+                        call_sid = call_sid_ref[0]
+
+                        # Suppress processing while TTS is playing to break feedback loop.
+                        # STT hears our own TTS output — without this guard the system
+                        # transcribes its own speech and responds forever.
+                        if call_sid and sessions.get(call_sid, {}).get("is_speaking"):
+                            print("[stt] Suppressed (TTS playing), discarding result", flush=True)
+                            continue
+
                         user_text = result.alternatives[0].transcript
                         confidence = result.alternatives[0].confidence
-                        # Per D-02 + RESEARCH Pattern 4: read result.language_code (BCP-47),
-                        # default to en-US when missing. Top-level on StreamingRecognitionResult.
                         detected_lang = result.language_code or "en-US"
                         print(f"[stt] Detected: '{user_text}' lang={detected_lang} (conf: {confidence:.2f})", flush=True)
 
-                        call_sid = call_sid_ref[0]
                         # Write detected language to session immediately (per D-02).
                         if call_sid and call_sid in sessions:
                             sessions[call_sid]["language"] = detected_lang
-                            # Append user turn to conversation history for Phase 2.
                             sessions[call_sid]["conversation_history"].append(
                                 {"role": "user", "text": user_text, "lang": detected_lang}
                             )
 
                         if confidence < 0.5 and len(result.alternatives) > 1:
                             alt = result.alternatives[1]
-                            print(f"[stt]   Alternative: '{alt.transcript}' (confidence: {alt.confidence:.2f})", flush=True)
+                            print(f"[stt]   Alternative: '{alt.transcript}' (conf: {alt.confidence:.2f})", flush=True)
 
                         translated = translate_client.translate(user_text, target_language="en")
                         english_text = translated["translatedText"]
                         print(f"[stt] English: {english_text}", flush=True)
 
                         if call_sid:
-                            gemini_response = query_gemini(english_text)
-                            # Plan 02 will give speak_response the new (call_sid, text, websocket, loop) signature.
-                            # Forward-compatible call: pass websocket + loop through.
+                            gemini_response = query_gemini(english_text, detected_lang)
                             speak_response(call_sid, gemini_response, websocket, loop)
                         else:
                             print("[stt] No call SID yet, skipping response", flush=True)
