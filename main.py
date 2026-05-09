@@ -28,69 +28,70 @@ async def twilio_webhook():
     """
     return Response(content=twiml, media_type="application/xml")
 
+import queue
+import threading
+
 @app.websocket("/media")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("WebSocket connection established")
+    print("WebSocket connection established", flush=True)
     
-    # Configure Speech-to-Text with Auto-Language Detection
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
-        sample_rate_hertz=8000,
-        language_code="en-US",  # Primary
-        alternative_language_codes=["fr-CA", "ar-SA", "es-ES"], # Detection list
-    )
+    # Bridge between Async WebSocket and Sync Speech Client
+    audio_queue = queue.Queue()
 
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=config,
-        interim_results=False
-    )
+    # 1. Thread-safe generator for the Speech Client
+    def request_generator():
+        # The first request must contain the configuration
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
+            sample_rate_hertz=8000,
+            language_code="en-US",
+            alternative_language_codes=["fr-CA", "ar-SA", "es-ES"],
+        )
+        streaming_config = speech.StreamingRecognitionConfig(config=config)
+        yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
 
-    async def request_generator():
         while True:
-            try:
-                message = await websocket.receive_text()
-                data = json.loads(message)
-                
-                if data['event'] == 'start':
-                    print(f"Twilio Stream Started: {data['start']['streamSid']}")
-                    continue
-                    
-                if data['event'] == 'media':
-                    # Extract raw audio bytes
-                    payload = data['media']['payload']
-                    yield speech.StreamingRecognizeRequest(audio_content=base64.b64decode(payload))
-                
-                if data['event'] == 'stop':
-                    print("Twilio Stream Stopped")
-                    break
-            except Exception as e:
-                print(f"Error in request_generator: {e}")
-                break
+            chunk = audio_queue.get()
+            if chunk is None:
+                return
+            yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-    # Process the stream
-    responses = speech_client.streaming_recognize(streaming_config, request_generator())
+    # 2. Function to process responses in a separate thread
+    def process_responses():
+        responses = speech_client.streaming_recognize(
+            requests=request_generator(),
+            config=None # Already sent in generator
+        )
+        try:
+            for response in responses:
+                for result in response.results:
+                    if result.is_final:
+                        user_text = result.alternatives[0].transcript
+                        print(f"Detected: {user_text}", flush=True)
+                        # Your translation/OpenJustice logic here
+        except Exception as e:
+            print(f"Speech Loop Error: {e}", flush=True)
 
+    # Start the speech processing thread
+    threading.Thread(target=process_responses, daemon=True).start()
+
+    # 3. Main async loop to receive Twilio messages
     try:
-        for response in responses:
-            for result in response.results:
-                if result.is_final:
-                    user_text = result.alternatives[0].transcript
-                    detected_lang = result.language_code
-                    
-                    # 1. Translate detected language to English
-                    translated = translate_client.translate(user_text, target_language='en')
-                    english_text = translated['translatedText']
-                    
-                    print(f"[{detected_lang}] User: {user_text}")
-                    print(f"[EN] Translated: {english_text}")
-
-                    # 2. Logic for OpenJustice/Gemini query goes here
-                    # response_from_ai = query_openjustice(english_text)
-                    
-                    # 3. Output logic (e.g., Twilio REST API to speak back)
+        while True:
+            message = await websocket.receive_text()
+            data = json.loads(message)
+            
+            if data['event'] == 'media':
+                audio_queue.put(base64.b64decode(data['media']['payload']))
+            
+            if data['event'] == 'stop':
+                print("Twilio Stream Stopped", flush=True)
+                break
     except Exception as e:
-        print(f"Streaming Error: {e}")
+        print(f"WebSocket Loop Error: {e}", flush=True)
+    finally:
+        audio_queue.put(None) # Signal the generator to stop
 
 if __name__ == "__main__":
     import uvicorn
