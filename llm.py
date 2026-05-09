@@ -61,14 +61,6 @@ def _lang_instruction(language_code: str) -> str:
     return f'Respond ONLY in {lang_name} (BCP-47: "{language_code}"). Do not add explanations about the language.'
 
 
-def get_greeting() -> str:
-    """Trilingual opening played immediately when the call connects."""
-    return (
-        "Welcome to JusticeLine. / Bienvenue à JusticeLine. / مرحباً بك في JusticeLine. "
-        "This is not an emergency service — for emergencies, please call 9-1-1. "
-        "I am an AI assistant, not a lawyer. Any information I provide is general only. "
-        "Please describe your legal situation."
-    )
 
 
 def handle_stage(call_sid: str, english_text: str, language_code: str) -> str:
