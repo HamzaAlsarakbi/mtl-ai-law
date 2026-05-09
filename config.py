@@ -28,3 +28,9 @@ print(f"[config] Twilio client {'ready' if twilio_client else 'NOT configured (m
 
 DOMAIN = _normalize_stream_host(os.getenv("TWILIO_STREAM_HOST", "openjustice-agent-966017992454.us-central1.run.app"))
 print(f"[config] Stream domain: {DOMAIN}", flush=True)
+
+# Session state keyed by Twilio CallSid. Initialized on 'start' event
+# in main.py, cleaned up on 'stop'. Module-level so any thread/module
+# can read/write via `from config import sessions` (per D-01).
+sessions: dict[str, dict] = {}
+print(f"[config] Sessions dict initialized (capacity: unlimited, single Cloud Run instance)", flush=True)
