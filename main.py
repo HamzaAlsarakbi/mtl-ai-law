@@ -8,6 +8,7 @@ import asyncio
 import base64
 import json
 import os
+import binascii
 import re
 import traceback
 from importlib import import_module
@@ -31,7 +32,9 @@ print("[main] JusticeLine starting (Gemini Live mode)", flush=True)
 _DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
 _MAX_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "10"))
 _active_sessions = 0
+
 _CALL_SID_RE = re.compile(r"^CA[0-9a-f]{32}$", re.IGNORECASE)
+
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 
 
@@ -93,6 +96,8 @@ _TOOLS = types.Tool(function_declarations=[
 
 app = FastAPI()
 _validator = RequestValidator(twilio_auth_token) if twilio_auth_token else None
+if not twilio_auth_token:
+    print("[main] WARNING: TWILIO_AUTH_TOKEN not set — webhook signature validation disabled", flush=True)
 
 # CallSid → caller's From number (captured at webhook, consumed at WebSocket start)
 _pending_callers: dict[str, str] = {}
@@ -184,21 +189,40 @@ async def media_stream(websocket: WebSocket):
     downsample_state = None
     greeted = False
 
-    client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
-    live_config = types.LiveConnectConfig(
-        system_instruction=SYSTEM_INSTRUCTION,
-        response_modalities=["AUDIO"],
-        tools=[_TOOLS],
-        speech_config=types.SpeechConfig(
-            voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
-            )
-        ),
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-    )
-
     try:
+        # Phase 1: validate start event before opening any Gemini session
+        while True:
+            try:
+                data = json.loads(await websocket.receive_text())
+            except json.JSONDecodeError:
+                continue
+            if data.get("event") == "start":
+                start = data.get("start") or {}
+                call_sid = start.get("callSid", "")
+                stream_sid = start.get("streamSid", "")
+                if call_sid not in _pending_callers:
+                    print("[main] Unknown callSid, closing WebSocket", flush=True)
+                    await websocket.close(code=1008)
+                    return
+                caller_number = _pending_callers.pop(call_sid)
+                print(f"[main] start: {call_sid} stream={stream_sid} from={_mask_phone(caller_number or '')}", flush=True)
+                break
+
+        # Phase 2: open Gemini Live only after a verified start event
+        client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+        live_config = types.LiveConnectConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            response_modalities=["AUDIO"],
+            tools=[_TOOLS],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+                )
+            ),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+        )
+
         async with client.aio.live.connect(model=MODEL, config=live_config) as session:
 
             async def _receiver():
@@ -252,21 +276,15 @@ async def media_stream(websocket: WebSocket):
             receiver_task = asyncio.create_task(_receiver())
 
             try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
+                while True:
+                    try:
+                        data = json.loads(await websocket.receive_text())
+                    except json.JSONDecodeError:
+                        continue
+
                     event = data.get("event")
 
-                    if event == "start":
-                        call_sid = data["start"]["callSid"]
-                        stream_sid = data["start"]["streamSid"]
-                        if call_sid not in _pending_callers:
-                            print("[main] Unknown callSid, closing WebSocket", flush=True)
-                            await websocket.close(code=1008)
-                            break
-                        caller_number = _pending_callers.pop(call_sid)
-                        print(f"[main] start: {call_sid} stream={stream_sid} from={_mask_phone(caller_number or '')}", flush=True)
-
-                    elif event == "media":
+                    if event == "media":
                         if receiver_task.done():
                             print("[main] Gemini receiver exited, closing call", flush=True)
                             break
@@ -279,7 +297,10 @@ async def media_stream(websocket: WebSocket):
                                 ),
                                 turn_complete=True,
                             )
-                        chunk = base64.b64decode(data["media"]["payload"])
+                        try:
+                            chunk = base64.b64decode(data["media"]["payload"])
+                        except (KeyError, binascii.Error):
+                            continue
                         pcm_16k, upsample_state = _audio_twilio_to_gemini(chunk, upsample_state)
                         if pcm_16k:
                             await session.send_realtime_input(
@@ -302,7 +323,7 @@ async def media_stream(websocket: WebSocket):
                     pass
                 print(f"[main] Session closed for {call_sid}", flush=True)
     except Exception:
-        print("[main] Gemini Live connection failed:", flush=True)
+        print("[main] connection error:", flush=True)
         if _DEBUG:
             traceback.print_exc()
         try:
@@ -310,6 +331,7 @@ async def media_stream(websocket: WebSocket):
         except Exception:
             pass
     finally:
+        _pending_callers.pop(call_sid, None)
         _active_sessions -= 1
 
 

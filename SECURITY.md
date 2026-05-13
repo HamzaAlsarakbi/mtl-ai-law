@@ -3,6 +3,7 @@
 **Audit date:** 2026-05-12
 **Auditor:** Claude Code (claude-sonnet-4-6)
 **Scope:** Phase 1 — Call Infrastructure (main.py, config.py, openjustice.py, sms.py, Dockerfile, requirements.txt)
+**Remediation:** PR #3 (hotline-fixes-and-security) addresses SEC-001 through SEC-008 — see summary table for current statuses.
 
 ---
 
@@ -47,7 +48,7 @@ JusticeLine exposes two unauthenticated public endpoints on Cloud Run: a `POST /
 
 ### [SEC-003] Service Account Key Baked into Docker Image — UNMITIGATED (CRITICAL-003)
 
-**Threat:** `hackathon-key.json` contains a live GCP service account private key (verified: `private_key_id: 015d4108fea8ee202ac6245d3a528e9679d20d68`, project `openjustice-hackathon-2026`). Because there is no `.dockerignore`, `COPY . .` in the Dockerfile copies this key into every built image. Anyone who pulls the image from the registry — including via a misconfigured Cloud Run service or a leaked image tag — obtains full service account credentials.
+**Threat:** `hackathon-key.json` contains a live GCP service account private key (project: `[redacted]`, key ID: `[redacted]`). Because there is no `.dockerignore`, `COPY . .` in the Dockerfile copies this key into every built image. Anyone who pulls the image from the registry — including via a misconfigured Cloud Run service or a leaked image tag — obtains full service account credentials.
 
 **Location:** `Dockerfile:5` (`COPY . .`), absent `.dockerignore`
 
@@ -206,14 +207,14 @@ None formally accepted at this time. SEC-005 (rate limiting) and SEC-006 (PII lo
 
 | ID | Title | Status |
 |----|-------|--------|
-| SEC-001 | No Twilio signature validation on /twilio-webhook | UNMITIGATED |
-| SEC-002 | /media WebSocket open to any client | UNMITIGATED |
-| SEC-003 | Service account key baked into Docker image | UNMITIGATED |
-| SEC-004 | API key logged in plaintext | UNMITIGATED |
-| SEC-005 | No rate limiting | UNMITIGATED |
-| SEC-006 | Caller phone number logged in plaintext | PARTIAL |
-| SEC-007 | Unvalidated Twilio form fields | PARTIAL |
-| SEC-008 | Stack traces in Cloud Logging | PARTIAL |
+| SEC-001 | No Twilio signature validation on /twilio-webhook | MITIGATED (PR #3) |
+| SEC-002 | /media WebSocket open to any client | MITIGATED (PR #3) |
+| SEC-003 | Service account key baked into Docker image | PARTIAL — .dockerignore added; key rotation still required |
+| SEC-004 | API key logged in plaintext | MITIGATED (PR #3) |
+| SEC-005 | No rate limiting | PARTIAL — session cap added; Cloud Armor not yet configured |
+| SEC-006 | Caller phone number logged in plaintext | MITIGATED (PR #3) |
+| SEC-007 | Unvalidated Twilio form fields | MITIGATED (PR #3) |
+| SEC-008 | Stack traces in Cloud Logging | MITIGATED (PR #3) |
 | SEC-009 | SSRF via OpenJustice URL | MITIGATED |
 | SEC-010 | Prompt injection into SMS body | MITIGATED |
 | SEC-011 | Service account key in git history | MITIGATED |

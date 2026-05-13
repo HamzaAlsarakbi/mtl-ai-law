@@ -1,5 +1,7 @@
 # Code Review
 
+> **Historical snapshot** — reflects code state at review time (pre-fix). Issues listed below were addressed in PR #3 (hotline-fixes-and-security). Statuses in this document are not updated.
+
 **Reviewed:** 2026-05-12  
 **Depth:** deep (cross-file analysis)  
 **Files Reviewed:** config.py, llm.py, main.py, openjustice.py, sms.py, stt.py, tts.py, tests/__init__.py, tests/conftest.py, tests/test_session.py, tests/test_stt.py, tests/test_tts.py, tests/test_webhook.py
