@@ -171,42 +171,42 @@ async def media_stream(websocket: WebSocket):
             async def _receiver():
                 nonlocal downsample_state
                 try:
-                    while True:
-                        async for response in session.receive():
-                            sc = response.server_content
-                            if sc:
-                                if sc.input_transcription and sc.input_transcription.text:
-                                    print(f"[user] {sc.input_transcription.text}", flush=True)
-                                if sc.output_transcription and sc.output_transcription.text:
-                                    print(f"[bot]  {sc.output_transcription.text}", flush=True)
-                                if sc.model_turn:
-                                    for part in sc.model_turn.parts:
-                                        if part.inline_data and part.inline_data.data:
-                                            b64, downsample_state = _audio_gemini_to_twilio(
-                                                part.inline_data.data, downsample_state
-                                            )
-                                            if stream_sid:
-                                                await websocket.send_json({
-                                                    "event": "media",
-                                                    "streamSid": stream_sid,
-                                                    "media": {"payload": b64},
-                                                })
-                                if sc.interrupted:
-                                    print("[gemini] turn interrupted by caller", flush=True)
+                    async for response in session.receive():
+                        sc = response.server_content
+                        if sc:
+                            if sc.input_transcription and sc.input_transcription.text:
+                                print(f"[user] {sc.input_transcription.text}", flush=True)
+                            if sc.output_transcription and sc.output_transcription.text:
+                                print(f"[bot]  {sc.output_transcription.text}", flush=True)
+                            if sc.model_turn:
+                                for part in sc.model_turn.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        b64, downsample_state = _audio_gemini_to_twilio(
+                                            part.inline_data.data, downsample_state
+                                        )
+                                        if stream_sid:
+                                            await websocket.send_json({
+                                                "event": "media",
+                                                "streamSid": stream_sid,
+                                                "media": {"payload": b64},
+                                            })
+                            if sc.interrupted:
+                                print("[gemini] turn interrupted by caller", flush=True)
 
-                            if response.tool_call:
-                                for fc in response.tool_call.function_calls:
-                                    result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
-                                    await session.send_tool_response(
-                                        function_responses=[types.FunctionResponse(
-                                            name=fc.name,
-                                            id=fc.id,
-                                            response={"result": result},
-                                        )]
-                                    )
+                        if response.tool_call:
+                            for fc in response.tool_call.function_calls:
+                                result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
+                                await session.send_tool_response(
+                                    function_responses=[types.FunctionResponse(
+                                        name=fc.name,
+                                        id=fc.id,
+                                        response={"result": result},
+                                    )]
+                                )
 
-                            if response.go_away:
-                                print(f"[gemini] go_away: {response.go_away}", flush=True)
+                        if response.go_away:
+                            print(f"[gemini] go_away: {response.go_away}", flush=True)
+                            return
                 except asyncio.CancelledError:
                     raise
                 except errors.APIError as e:
@@ -228,9 +228,12 @@ async def media_stream(websocket: WebSocket):
                         caller_number = _pending_callers.pop(call_sid, None)
                         print(f"[main] start: {call_sid} stream={stream_sid} from={caller_number}", flush=True)
 
+                    elif event == "media":
+                        if receiver_task.done():
+                            print("[main] Gemini receiver exited, closing call", flush=True)
+                            break
                         if not greeted:
                             greeted = True
-                            # Live API does not auto-greet — kick off step 1 of the call flow.
                             await session.send_client_content(
                                 turns=types.Content(
                                     role="user",
@@ -238,8 +241,6 @@ async def media_stream(websocket: WebSocket):
                                 ),
                                 turn_complete=True,
                             )
-
-                    elif event == "media":
                         chunk = base64.b64decode(data["media"]["payload"])
                         pcm_16k, upsample_state = _audio_twilio_to_gemini(chunk, upsample_state)
                         if pcm_16k:
