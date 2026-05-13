@@ -31,7 +31,7 @@ print("[main] JusticeLine starting (Gemini Live mode)", flush=True)
 _DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
 _MAX_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "10"))
 _active_sessions = 0
-_CALL_SID_RE = re.compile(r"^CA[0-9a-f]{32}$")
+_CALL_SID_RE = re.compile(r"^CA[0-9a-f]{32}$", re.IGNORECASE)
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 
 
