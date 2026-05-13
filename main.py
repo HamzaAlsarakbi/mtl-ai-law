@@ -8,6 +8,8 @@ import asyncio
 import base64
 import json
 import os
+import binascii
+import re
 import traceback
 from importlib import import_module
 
@@ -19,12 +21,28 @@ except ImportError:
 from fastapi import FastAPI, Request, Response, WebSocket
 from google import genai
 from google.genai import errors, types
+from twilio.request_validator import RequestValidator
 
-from config import PROJECT_ID, LOCATION, DOMAIN
+from config import PROJECT_ID, LOCATION, DOMAIN, twilio_auth_token
 from openjustice import query_openjustice
 from sms import send_sms_resources
 
 print("[main] JusticeLine starting (Gemini Live mode)", flush=True)
+
+_DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+_MAX_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "10"))
+_active_sessions = 0
+
+_CALL_SID_RE = re.compile(r"^CA[0-9a-f]{32}$", re.IGNORECASE)
+
+_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+
+
+def _mask_phone(number: str) -> str:
+    if len(number) <= 7:
+        return "***"
+    return number[:3] + "***" + number[-4:]
+
 
 MODEL = "gemini-live-2.5-flash-native-audio"
 
@@ -77,6 +95,9 @@ _TOOLS = types.Tool(function_declarations=[
 ])
 
 app = FastAPI()
+_validator = RequestValidator(twilio_auth_token) if twilio_auth_token else None
+if not twilio_auth_token:
+    print("[main] WARNING: TWILIO_AUTH_TOKEN not set — webhook signature validation disabled", flush=True)
 
 # CallSid → caller's From number (captured at webhook, consumed at WebSocket start)
 _pending_callers: dict[str, str] = {}
@@ -90,11 +111,23 @@ async def health():
 @app.post("/twilio-webhook")
 async def twilio_webhook(request: Request):
     form = await request.form()
+    params = dict(form)
+
+    if _validator:
+        signature = request.headers.get("X-Twilio-Signature", "")
+        if not _validator.validate(str(request.url), params, signature):
+            return Response(status_code=403, content="Forbidden")
+
     call_sid = form.get("CallSid", "")
     from_number = form.get("From", "")
-    if call_sid:
-        _pending_callers[call_sid] = from_number
-        print(f"[main] Incoming call: {call_sid} from {from_number}", flush=True)
+
+    if not _CALL_SID_RE.match(call_sid):
+        return Response(status_code=400, content="Bad Request")
+    if from_number and not _E164_RE.match(from_number):
+        from_number = ""
+
+    _pending_callers[call_sid] = from_number
+    print(f"[main] Incoming call: {call_sid} from {_mask_phone(from_number)}", flush=True)
 
     stream_url = f"wss://{DOMAIN}/media"
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -131,7 +164,7 @@ async def _handle_tool_call(fc_name: str, fc_args: dict, caller_number: str | No
         return result
     if fc_name == "send_sms_resources":
         language_code = fc_args.get("language_code") or "en"
-        print(f"[tool] send_sms_resources: to={caller_number} lang={language_code}", flush=True)
+        print(f"[tool] send_sms_resources: to={_mask_phone(caller_number or '')} lang={language_code}", flush=True)
         if caller_number:
             sent = await loop.run_in_executor(None, send_sms_resources, caller_number, language_code)
             return "SMS sent successfully" if sent else "SMS could not be delivered"
@@ -141,6 +174,11 @@ async def _handle_tool_call(fc_name: str, fc_args: dict, caller_number: str | No
 
 @app.websocket("/media")
 async def media_stream(websocket: WebSocket):
+    global _active_sessions
+    if _active_sessions >= _MAX_SESSIONS:
+        await websocket.close(code=1008)
+        return
+    _active_sessions += 1
     await websocket.accept()
     print("[main] WebSocket accepted", flush=True)
 
@@ -151,86 +189,107 @@ async def media_stream(websocket: WebSocket):
     downsample_state = None
     greeted = False
 
-    client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
-    live_config = types.LiveConnectConfig(
-        system_instruction=SYSTEM_INSTRUCTION,
-        response_modalities=["AUDIO"],
-        tools=[_TOOLS],
-        speech_config=types.SpeechConfig(
-            voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
-            )
-        ),
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-    )
-
     try:
+        # Phase 1: validate start event before opening any Gemini session
+        while True:
+            try:
+                data = json.loads(await websocket.receive_text())
+            except json.JSONDecodeError:
+                continue
+            if data.get("event") == "start":
+                start = data.get("start") or {}
+                call_sid = start.get("callSid", "")
+                stream_sid = start.get("streamSid", "")
+                if call_sid not in _pending_callers:
+                    print("[main] Unknown callSid, closing WebSocket", flush=True)
+                    await websocket.close(code=1008)
+                    return
+                caller_number = _pending_callers.pop(call_sid)
+                print(f"[main] start: {call_sid} stream={stream_sid} from={_mask_phone(caller_number or '')}", flush=True)
+                break
+
+        # Phase 2: open Gemini Live only after a verified start event
+        client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+        live_config = types.LiveConnectConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            response_modalities=["AUDIO"],
+            tools=[_TOOLS],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+                )
+            ),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+        )
+
         async with client.aio.live.connect(model=MODEL, config=live_config) as session:
 
             async def _receiver():
                 nonlocal downsample_state
                 try:
-                    while True:
-                        async for response in session.receive():
-                            sc = response.server_content
-                            if sc:
-                                if sc.input_transcription and sc.input_transcription.text:
-                                    print(f"[user] {sc.input_transcription.text}", flush=True)
-                                if sc.output_transcription and sc.output_transcription.text:
-                                    print(f"[bot]  {sc.output_transcription.text}", flush=True)
-                                if sc.model_turn:
-                                    for part in sc.model_turn.parts:
-                                        if part.inline_data and part.inline_data.data:
-                                            b64, downsample_state = _audio_gemini_to_twilio(
-                                                part.inline_data.data, downsample_state
-                                            )
-                                            if stream_sid:
-                                                await websocket.send_json({
-                                                    "event": "media",
-                                                    "streamSid": stream_sid,
-                                                    "media": {"payload": b64},
-                                                })
-                                if sc.interrupted:
-                                    print("[gemini] turn interrupted by caller", flush=True)
+                    async for response in session.receive():
+                        sc = response.server_content
+                        if sc:
+                            if sc.input_transcription and sc.input_transcription.text:
+                                print(f"[user] {sc.input_transcription.text}", flush=True)
+                            if sc.output_transcription and sc.output_transcription.text:
+                                print(f"[bot]  {sc.output_transcription.text}", flush=True)
+                            if sc.model_turn:
+                                for part in sc.model_turn.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        b64, downsample_state = _audio_gemini_to_twilio(
+                                            part.inline_data.data, downsample_state
+                                        )
+                                        if stream_sid:
+                                            await websocket.send_json({
+                                                "event": "media",
+                                                "streamSid": stream_sid,
+                                                "media": {"payload": b64},
+                                            })
+                            if sc.interrupted:
+                                print("[gemini] turn interrupted by caller", flush=True)
 
-                            if response.tool_call:
-                                for fc in response.tool_call.function_calls:
-                                    result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
-                                    await session.send_tool_response(
-                                        function_responses=[types.FunctionResponse(
-                                            name=fc.name,
-                                            id=fc.id,
-                                            response={"result": result},
-                                        )]
-                                    )
+                        if response.tool_call:
+                            for fc in response.tool_call.function_calls:
+                                result = await _handle_tool_call(fc.name, dict(fc.args), caller_number)
+                                await session.send_tool_response(
+                                    function_responses=[types.FunctionResponse(
+                                        name=fc.name,
+                                        id=fc.id,
+                                        response={"result": result},
+                                    )]
+                                )
 
-                            if response.go_away:
-                                print(f"[gemini] go_away: {response.go_away}", flush=True)
+                        if response.go_away:
+                            print(f"[gemini] go_away: {response.go_away}", flush=True)
+                            return
                 except asyncio.CancelledError:
                     raise
                 except errors.APIError as e:
                     print(f"[gemini] APIError: code={getattr(e, 'code', None)} {e}", flush=True)
                 except Exception:
                     print("[gemini] receiver crashed:", flush=True)
-                    traceback.print_exc()
+                    if _DEBUG:
+                        traceback.print_exc()
 
             receiver_task = asyncio.create_task(_receiver())
 
             try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
+                while True:
+                    try:
+                        data = json.loads(await websocket.receive_text())
+                    except json.JSONDecodeError:
+                        continue
+
                     event = data.get("event")
 
-                    if event == "start":
-                        call_sid = data["start"]["callSid"]
-                        stream_sid = data["start"]["streamSid"]
-                        caller_number = _pending_callers.pop(call_sid, None)
-                        print(f"[main] start: {call_sid} stream={stream_sid} from={caller_number}", flush=True)
-
+                    if event == "media":
+                        if receiver_task.done():
+                            print("[main] Gemini receiver exited, closing call", flush=True)
+                            break
                         if not greeted:
                             greeted = True
-                            # Live API does not auto-greet — kick off step 1 of the call flow.
                             await session.send_client_content(
                                 turns=types.Content(
                                     role="user",
@@ -238,9 +297,10 @@ async def media_stream(websocket: WebSocket):
                                 ),
                                 turn_complete=True,
                             )
-
-                    elif event == "media":
-                        chunk = base64.b64decode(data["media"]["payload"])
+                        try:
+                            chunk = base64.b64decode(data["media"]["payload"])
+                        except (KeyError, binascii.Error):
+                            continue
                         pcm_16k, upsample_state = _audio_twilio_to_gemini(chunk, upsample_state)
                         if pcm_16k:
                             await session.send_realtime_input(
@@ -253,7 +313,8 @@ async def media_stream(websocket: WebSocket):
 
             except Exception:
                 print("[main] WebSocket error:", flush=True)
-                traceback.print_exc()
+                if _DEBUG:
+                    traceback.print_exc()
             finally:
                 receiver_task.cancel()
                 try:
@@ -262,12 +323,16 @@ async def media_stream(websocket: WebSocket):
                     pass
                 print(f"[main] Session closed for {call_sid}", flush=True)
     except Exception:
-        print("[main] Gemini Live connection failed:", flush=True)
-        traceback.print_exc()
+        print("[main] connection error:", flush=True)
+        if _DEBUG:
+            traceback.print_exc()
         try:
             await websocket.close()
         except Exception:
             pass
+    finally:
+        _pending_callers.pop(call_sid, None)
+        _active_sessions -= 1
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+# Credentials — never bake keys into image layers
+hackathon-key.json
+*-key.json
+*.pem
+.env
+.env.*
+
+# Development artifacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Planning and review artifacts
+.planning/
+REVIEW.md
+SECURITY.md
+
+# Version control
+.git/
+.gitignore
