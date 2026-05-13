@@ -15,7 +15,6 @@ _FALLBACK = (
 
 
 def query_openjustice(situation: str, jurisdiction: str) -> str:
-    print("Using key and flow:", OJ_KEY, OJ_FLOW_ID, flush=True)
     if not OJ_FLOW_ID:
         print("[oj] OPENJUSTICE_DIALOG_FLOW_ID not set — returning fallback", flush=True)
         return _FALLBACK
