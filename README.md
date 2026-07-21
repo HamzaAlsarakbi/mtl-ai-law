@@ -9,13 +9,13 @@
 Short prototype built during the Montreal AI x Law hackathon. This repository contains a Python-based prototype that ties together an "open justice" data helper, an SMS/webhook interface, and a small web service used during the competition. The project won 1st place at the hackathon.
 
 Key files
-- `main.py` — application entrypoint (starts the web service)
-- `openjustice.py` — helper(s) for interacting with open justice / legal data
-- `sms.py` — SMS integration helpers (e.g., Twilio webhook handlers)
-- `config.py` — configuration values and environment keys
-- `tests/` — unit tests (see `tests/test_session.py` and `tests/test_webhook.py`)
+- `main.py` - application entrypoint (starts the web service)
+- `openjustice.py` - helper(s) for interacting with open justice / legal data
+- `sms.py` - SMS integration helpers (e.g., Twilio webhook handlers)
+- `config.py` - configuration values and environment keys
+- `tests/` - unit tests (see `tests/test_session.py` and `tests/test_webhook.py`)
 - `requirements.txt` — Python dependencies
-- `Dockerfile` — Docker container definition
+- `Dockerfile` - Docker container definition
 
 Requirements
 - Python 3.8+ (use a virtual environment)
