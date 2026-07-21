@@ -1,6 +1,6 @@
 # JusticeLine
 
-> First place — Montreal AI x Law Hackathon (May 9)
+> First place - Montreal AI x Law Hackathon (May 9)
 >
 > LinkedIn post: https://www.linkedin.com/posts/montreal-ai-x-law-hackathon_le-9-mai-dernier-nous-%C3%A9tions-ravies-d-activity-7460446147787128832-0bwn
 >
